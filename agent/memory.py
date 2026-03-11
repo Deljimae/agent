@@ -55,33 +55,28 @@ def cosine_similarity(v1, v2):
     return np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
 
 
-def search_semantic_memory(query_text, top_k=5):
-    """
-    1. Turns the user query into a vector.
-    2. Compares it against ALL stored facts.
-    3. Returns the top 5 most relevant facts.
-    """
-    query_vector = get_embedding(query_text)
-    
+def search_memory_tier(table_name, query_vector, top_k=3, threshold=0.70):
+    """Generic search for any of the 3 memory tables."""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute("SELECT fact, category, vector FROM semantic_memory")
+    
+    # Dynamically select columns based on table
+    columns = "*" 
+    cursor.execute(f"SELECT {columns} FROM {table_name}")
     rows = cursor.fetchall()
     conn.close()
 
-    if not rows:
-        return []
-
     results = []
-    for fact, category, blob in rows:
-        stored_vector = pickle.loads(blob) # Unpickle the vector
+    for row in rows:
+        # Tables have different structures, but vector is always the 2nd to last col
+        stored_vector = pickle.loads(row[-2]) 
         score = cosine_similarity(query_vector, stored_vector)
-        results.append((score, fact, category))
+        
+       
+        results.append((score, row))
 
-    # Sort by highest similarity score
     results.sort(key=lambda x: x[0], reverse=True)
     return results[:top_k]
-
 
 # --- STAGE 2: THE VAULT (Save Logic) ---
 def save_memory_notes(reflection_json):
@@ -120,20 +115,36 @@ def save_memory_notes(reflection_json):
     conn.commit()
     conn.close()
 
-# --- STAGE 3: THE RETRIEVAL (Load Logic) ---
+
 def load_long_term_memory(user_query):
     """
-    The 'Search Engine'. Finds the most relevant bits of 
-    info based on what the user just said.
+    The 'Tri-Core' Search: Finds relevant Facts, Rules, and Past Experiences.
     """
-    # Use our semantic search function from Stage 3
-    results = search_semantic_memory(user_query, top_k=5)
+    query_vector = get_embedding(user_query)
     
-    if not results:
+    # 1. Search all tiers
+    semantic_hits = search_memory_tier("semantic_memory", query_vector)
+    episodic_hits = search_memory_tier("episodic_memory", query_vector)
+    procedural_hits = search_memory_tier("procedural_memory", query_vector)
+
+    if not (semantic_hits or episodic_hits or procedural_hits):
         return "No relevant past memories found."
 
-    context = "\nRELEVANT MEMORIES:\n"
-    for score, fact, cat in results:
-        context += f"- [{cat}] {fact} (Match: {score:.2f})\n"
+    context = "\n=== LONG-TERM MEMORY RETRIEVED ===\n"
+
+    if semantic_hits:
+        context += "\n[KNOWLEDGE & FACTS]:\n"
+        for score, row in semantic_hits:
+            context += f"- {row[1]} (Category: {row[2]})\n"
+
+    if procedural_hits:
+        context += "\n[RULES & PROCEDURES]:\n"
+        for score, row in procedural_hits:
+            context += f"- RULE: {row[1]} | CONTEXT: {row[2]}\n"
+
+    if episodic_hits:
+        context += "\n[PAST EXPERIENCES]:\n"
+        for score, row in episodic_hits:
+            context += f"- EVENT: {row[1]} | OUTCOME: {row[2]}\n"
     
-    return context
+    return context + "\n==================================\n"

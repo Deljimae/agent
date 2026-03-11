@@ -1,88 +1,80 @@
 import json
+import asyncio
 from config import client, MAX_MESSAGES
-from tools.registry import tools, AVAILABLE_TOOLS
+from tools.registry import tools as static_tools, AVAILABLE_TOOLS
 from agent.logger import log_step, print_conversation
-from agent.memory import save_memory_notes
-
-
 
 SYSTEM_MESSAGE = {
     "role": "system",
     "content": (
         "You are a versatile research assistant with access to real-time tools.\n\n"
-        "1. EXA SEARCH: Use this for web-based queries. Cite source URLs.\n"
-        "2. WEATHER DATA: Use this for current conditions using coordinates.\n\n"
-        "Choose the most appropriate tool. You may use multiple in sequence."
+
+        "Available tools:\n"
+        "1. EXA SEARCH – Use this for web-based queries. Always cite source URLs.\n"
+        "2. WEATHER DATA – Use this to retrieve current weather conditions using coordinates.\n\n"
+
+        "Instructions:\n"
+        "- Choose the most appropriate tool for the task.\n"
+        "- You may use multiple tools in sequence if necessary."
     ),
 }
 
 
-def execute_tool_calls(tool_call):
-    f_name = tool_call.name
-    f_args = json.loads(tool_call.arguments)
-    function_to_call = AVAILABLE_TOOLS.get(f_name)
+async def run_agent(user_query, conversation, mcp_client=None):
+    # 1. Merge static tools with MCP tools
+    all_tools = list(static_tools)
+    mcp_tool_definitions = []
+    
+    if mcp_client:
+        # Get dynamic tools from your local server
+        raw_mcp = await mcp_client.session.list_tools()
+        mcp_tool_definitions = mcp_client.translate_to_openai(raw_mcp.tools)
+        all_tools.extend(mcp_tool_definitions)
 
-    if function_to_call:
-        results = function_to_call(**f_args)
-        return {
-            "type": "function_call_output",
-            "call_id": tool_call.call_id,
-            "output": json.dumps(results)
-        }
-    raise ValueError(f"Unknown tool: {f_name}")
-
-
-
-
-def run_agent(user_query, conversation):
-
-    conversation.append({"role": "user", "content": user_query})
-
-    # SLIDING WINDOW LOGIC
+    # Sliding window logic
     while len(conversation) > MAX_MESSAGES:
-        if len(conversation) > 1:
-            conversation.pop(1)
-        
+        if len(conversation) > 1: conversation.pop(1)
 
     iteration_count = 0
     total_tools_executed = 0
 
     while True:
         iteration_count += 1
+        # Use the Async OpenAI call
         response = client.responses.create(
             model="gpt-4o-mini",
-            tools=tools,
+            tools=all_tools,
             input=conversation,
         )
 
-        # Append model output to conversation
         conversation += response.output
-
-        # Collect tool calls
-        tool_calls = [
-            item for item in response.output 
-            if item.type == "function_call"
-        ]
-
-        # NEW: Print the formatted log for this turn
+        tool_calls = [item for item in response.output if item.type == "function_call"]
+        
         log_step(iteration_count, tool_calls)
         total_tools_executed += len(tool_calls)
-        
 
         if not tool_calls:
-            # Print Final Summary before breaking
             print(f"\n{'*'*10} AGENT FINISHED {'*'*10}")
-            print(f"Total Iterations: {iteration_count}")
-            print(f"Total Tool Calls: {total_tools_executed}")
-            print(f"{'*'*36}\n")
             print(response.output_text)
-            print_conversation(conversation)
-            print(conversation)
             break
 
-        # Execute each tool call
         for tool_call in tool_calls:
-            tool_result = execute_tool_calls(tool_call)
-            conversation.append(tool_result)
+            f_name = tool_call.name
+            f_args = json.loads(tool_call.arguments)
 
+            # BRANCH: Is it a Static Tool or an MCP Tool?
+            if f_name in AVAILABLE_TOOLS:
+                # Handle static tools (Weather/Exa) - these are sync
+                result = AVAILABLE_TOOLS[f_name](**f_args)
+            else:
+                # Handle MCP tools (File Intel) - these are async
+                print(f"  [MCP] Routing to Local Server: {f_name}")
+                result = await mcp_client.call_tool(f_name, f_args)
 
+            conversation.append({
+                "type": "function_call_output",
+                "call_id": tool_call.call_id,
+                "output": json.dumps(result)
+            })
+
+    return response
